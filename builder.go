@@ -7,39 +7,26 @@ import (
 	"reflect"
 )
 
-type WalkVisitor struct {
-	Packages map[string]*Package
-}
-
-func (v *WalkVisitor) Visit(node ast.Node) (w ast.Visitor) {
-	if node == nil {
-		return nil
+func Build(pkgs map[string]*ast.Package) map[string]*Package {
+	res := map[string]*Package{}
+	for _, pkg := range pkgs {
+		res[pkg.Name] = &Package{Name: pkg.Name}
 	}
-
-	switch node := node.(type) {
-	case *ast.File:
-		if v.Packages == nil {
-			v.Packages = map[string]*Package{}
-		}
-
-		pkgName := node.Name.Name
-		pkg, ok := v.Packages[pkgName]
-		if !ok {
-			pkg = &Package{Name: pkgName}
-			v.Packages[pkgName] = pkg
-		}
-
-		return &fileVisitor{
-			Package:  pkg,
-			Packages: v.Packages,
+	for _, pkg := range pkgs {
+		for _, file := range pkg.Files {
+			visitor := &fileVisitor{
+				Package: res[file.Name.Name],
+				Scope:   new(FileScope),
+			}
+			ast.Walk(visitor, file)
 		}
 	}
-	return v
+	return res
 }
 
 type fileVisitor struct {
-	Package  *Package
-	Packages map[string]*Package
+	Package *Package
+	Scope   *FileScope
 }
 
 func (v *fileVisitor) Visit(node ast.Node) (w ast.Visitor) {
@@ -52,50 +39,47 @@ func (v *fileVisitor) Visit(node ast.Node) (w ast.Visitor) {
 		switch node.Tok {
 		case token.IMPORT:
 			for _, sp := range node.Specs {
-				imp := importSpec(sp.(*ast.ImportSpec))
+				imp := v.importSpec(sp.(*ast.ImportSpec))
 				if imp != nil {
-					v.Package.Impoprts = append(v.Package.Impoprts, imp)
+					v.Scope.Impoprts = append(v.Scope.Impoprts, imp)
 				}
 			}
 		case token.TYPE:
 			for _, sp := range node.Specs {
-				decl := typeSpec(sp.(*ast.TypeSpec))
+				decl := v.typeSpec(sp.(*ast.TypeSpec))
 				if decl != nil {
 					v.Package.Types = append(v.Package.Types, decl)
 				}
 			}
 		case token.CONST:
 			for _, sp := range node.Specs {
-				decls := valueSpec(sp.(*ast.ValueSpec))
+				decls := v.valueSpec(sp.(*ast.ValueSpec))
 				if len(decls) > 0 {
 					v.Package.Consts = append(v.Package.Consts, decls...)
 				}
 			}
 		case token.VAR:
 			for _, sp := range node.Specs {
-				valueSpec(sp.(*ast.ValueSpec))
-				decls := valueSpec(sp.(*ast.ValueSpec))
+				decls := v.valueSpec(sp.(*ast.ValueSpec))
 				if len(decls) > 0 {
 					v.Package.Vars = append(v.Package.Vars, decls...)
 				}
 			}
 		}
-		return v
 	case *ast.FuncDecl:
-		f := fun(node.Type)
+		f := v.fun(node.Type)
 		if node.Recv != nil {
-			f.Receiver = ty(node.Recv.List[0].Type)
+			f.Receiver = v.ty(node.Recv.List[0].Type)
 		}
 		v.Package.Funcs = append(v.Package.Funcs, &Decl{
 			Name: node.Name.Name,
-			Type: &Type{F: f},
+			Type: v.newType(f),
 		})
-		return v
 	}
-	return nil
+	return v
 }
 
-func importSpec(spec *ast.ImportSpec) *Import {
+func (v *fileVisitor) importSpec(spec *ast.ImportSpec) *Import {
 	name := ""
 	if spec.Name != nil {
 		name = spec.Name.Name
@@ -103,95 +87,88 @@ func importSpec(spec *ast.ImportSpec) *Import {
 	return &Import{Name: name, Path: spec.Path.Value}
 }
 
-func typeSpec(spec *ast.TypeSpec) *Decl {
-	t := ty(spec.Type)
+func (v *fileVisitor) typeSpec(spec *ast.TypeSpec) *Decl {
+	t := v.ty(spec.Type)
 	if t == nil {
 		return nil
 	}
 	return &Decl{Name: spec.Name.Name, Type: t}
 }
 
-func valueSpec(spec *ast.ValueSpec) []*Decl {
+func (v *fileVisitor) valueSpec(spec *ast.ValueSpec) []*Decl {
 	var decls []*Decl
 	for i, name := range spec.Names {
 		if spec.Type != nil {
 			decls = append(decls, &Decl{
 				Name: name.Name,
-				Type: ty(spec.Type),
+				Type: v.ty(spec.Type),
 			})
 		} else {
 			decls = append(decls, &Decl{
 				Name: name.Name,
-				Type: litTy(spec.Values[i]),
+				Type: v.litTy(spec.Values[i]),
 			})
 		}
 	}
 	return decls
 }
 
-func ty(expr ast.Expr) *Type {
+func (v *fileVisitor) ty(expr ast.Expr) *Type {
 	switch expr := expr.(type) {
 	case *ast.StarExpr:
-		ty := ty(expr.X)
-		ty.Star = ty.Star + 1
+		ty := v.ty(expr.X)
+		ty.Ptr = ty.Ptr + 1
 		return ty
 	case *ast.Ident:
 		name := expr.Name
-		if isPrimitive(name) {
-			return &Type{P: Primitive(expr.Name)}
+		pn := primName(name)
+		if pn != Undefined {
+			return v.newType(&Primitive{Base: pn})
 		}
-		return &Type{R: &Ref{Name: expr.Name}}
+		return v.newType(&Ref{Name: expr.Name})
 	case *ast.ArrayType:
-		return &Type{A: &Array{Type: ty(expr.Elt)}}
+		return v.newType(&Array{Type: v.ty(expr.Elt)})
 	case *ast.MapType:
-		return &Type{M: &Map{
-			KeyType:   ty(expr.Key),
-			ValueType: ty(expr.Value),
-		}}
+		return v.newType(&Map{
+			KeyType:   v.ty(expr.Key),
+			ValueType: v.ty(expr.Value),
+		})
 	case *ast.FuncType:
-		return &Type{F: fun(expr)}
+		return v.newType(v.fun(expr))
 	case *ast.StructType:
 		var f []*Decl
 		if expr.Fields.NumFields() > 0 {
-			f = fields(expr.Fields.List)
+			f = v.fields(expr.Fields.List)
 		}
-		return &Type{S: &Struct{Fields: f}}
+		return v.newType(&Struct{Fields: f})
 	case *ast.InterfaceType:
 		var f []*Decl
 		if expr.Methods.NumFields() > 0 {
-			f = fields(expr.Methods.List)
+			f = v.fields(expr.Methods.List)
 		}
-		return &Type{I: &Interface{Methods: f}}
+		return v.newType(&Interface{Methods: f})
 	case *ast.Ellipsis:
-		return &Type{E: &Ellipse{Type: ty(expr.Elt)}}
+		return v.newType(&Ellipse{Type: v.ty(expr.Elt)})
 	case *ast.SelectorExpr:
-		return &Type{R: &Ref{
+		return v.newType(&Ref{
 			Package: pkg(expr.X),
 			Name:    expr.Sel.Name,
-		}}
+		})
 	default:
 		log.Println("**** unknown type:", reflect.TypeOf(expr).String(), expr)
 		return nil
 	}
 }
 
-func pkg(expr ast.Expr) string {
-	switch expr := expr.(type) {
-	case *ast.Ident:
-		return expr.Name
-	}
-	return ""
-}
-
-func fun(fun *ast.FuncType) *Function {
+func (v *fileVisitor) fun(fun *ast.FuncType) *Function {
 	var args []*Decl
 	var results []*Decl
 
 	if fun.Params.NumFields() > 0 {
-		args = fields(fun.Params.List)
+		args = v.fields(fun.Params.List)
 	}
 	if fun.Results.NumFields() > 0 {
-		results = fields(fun.Results.List)
+		results = v.fields(fun.Results.List)
 	}
 	return &Function{
 		Args:    args,
@@ -199,36 +176,46 @@ func fun(fun *ast.FuncType) *Function {
 	}
 }
 
-func fields(fields []*ast.Field) []*Decl {
+func (v *fileVisitor) fields(fields []*ast.Field) []*Decl {
 	var decls []*Decl
 	for _, field := range fields {
 		if len(field.Names) == 0 {
-			decls = append(decls, &Decl{Type: ty(field.Type)})
+			decls = append(decls, &Decl{Type: v.ty(field.Type)})
 			continue
 		}
 		for _, name := range field.Names {
 			decls = append(decls, &Decl{
 				Name: name.Name,
-				Type: ty(field.Type),
+				Type: v.ty(field.Type),
 			})
 		}
 	}
 	return decls
 }
 
-func litTy(expr ast.Expr) *Type {
+func (v *fileVisitor) litTy(expr ast.Expr) *Type {
 	switch expr := expr.(type) {
 	case *ast.CompositeLit:
-		return ty(expr.Type)
+		return v.ty(expr.Type)
 	case *ast.BasicLit:
-		return &Type{P: basicLit(expr.Kind)}
+		return v.newType(&Primitive{Base: basicLit(expr.Kind)})
 	case *ast.FuncLit:
-		return ty(expr.Type)
+		return v.ty(expr.Type)
 	}
 	return nil
 }
 
-func basicLit(kind token.Token) Primitive {
+func (v *fileVisitor) newType(t interface{}) *Type {
+	ty := newType(t)
+	if ty == nil {
+		return nil
+	}
+	ty.pkg = v.Package
+	ty.imports = v.Scope.Impoprts
+	return ty
+}
+
+func basicLit(kind token.Token) PrimName {
 	switch kind {
 	case token.INT: // 12345
 		return Int
@@ -242,4 +229,12 @@ func basicLit(kind token.Token) Primitive {
 		return String
 	}
 	return Undefined
+}
+
+func pkg(expr ast.Expr) string {
+	switch expr := expr.(type) {
+	case *ast.Ident:
+		return expr.Name
+	}
+	return ""
 }
