@@ -233,9 +233,9 @@ func basicLit(kind token.Token) Primitive {
 	case token.INT: // 12345
 		return Int
 	case token.FLOAT: // 123.45
-		return Float32
+		return Float64
 	case token.IMAG: // 123.45i
-		return Complex
+		return Complex64
 	case token.CHAR: // 'a'
 		return Rune
 	case token.STRING: // "abc"

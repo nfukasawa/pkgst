@@ -90,7 +90,6 @@ const (
 	Rune                 = "rune"
 	Float32              = "float32"
 	Float64              = "float64"
-	Complex              = "complex"
 	Complex64            = "complex64"
 	Complex128           = "complex128"
 )
@@ -114,7 +113,6 @@ func isPrimitive(s string) bool {
 		p == Rune ||
 		p == Float32 ||
 		p == Float64 ||
-		p == Complex ||
 		p == Complex64 ||
 		p == Complex128)
 }
